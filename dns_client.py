@@ -35,25 +35,44 @@ class DNS_ISSClient(ISSClient):
         url = self._url
         query = self._make_query(start)
         print(f"{datetime.now()}: DNS_ISSClient.get.url: {url}")
-        for dns_server in ['77.88.8.1', '8.8.8.8', ]:
+        attempt = 0
+        original_connector = self._session._connector
+        while True:
+            dns_server = ['77.88.8.1', '8.8.8.8'][attempt % 2]
+            attempt += 1
             connector = None
             try:
                 resolver = aiohttp.resolver.AsyncResolver(nameservers=[dns_server])
                 connector = aiohttp.TCPConnector(resolver=resolver)
                 self._session._connector = connector
-                async with self._session.get(url, params=query) as response:
+                async with self._session.get(
+                    url, params=query, timeout=aiohttp.ClientTimeout(total=60)
+                ) as response:
                     try:
                         response.raise_for_status()
                     except client_exceptions.ClientResponseError as err:
-                        raise ISSMoexError("Неверный url", result.url) from err
+                        if err.status not in (408, 429) and not 500 <= err.status < 600:
+                            raise ISSMoexError(
+                                f"Ошибка HTTP {err.status}", response.url
+                            ) from err
+                        raise
                     else:
                         result = await response.json()
                         return result[1]
-            except (aiohttp.ClientError, socket.gaierror) as e:
-                print(f"Failed to make a request to '{url}' using DNS server '{dns_server}'. Error: {e}")
-                continue
+            except (aiohttp.ClientError, socket.gaierror, asyncio.TimeoutError) as e:
+                # Ошибки сертификатов не исправляются повторением запроса.
+                if isinstance(e, (aiohttp.ClientSSLError, aiohttp.ServerFingerprintMismatch)):
+                    raise
+                delay = min(2 ** min(attempt, 6), 60)
+                print(
+                    f"Ошибка запроса '{url}', start={start}, DNS={dns_server}, "
+                    f"попытка {attempt}: {e}. Повтор через {delay} с."
+                )
             finally:
+                self._session._connector = original_connector
                 if connector and not connector.closed:
                     await connector.close()
-        return None
+            # Повторяем ту же страницу без ограничения числа попыток.
+            # asyncio.sleep позволяет прервать ожидание отменой задачи / Ctrl+C.
+            await asyncio.sleep(delay)
 
